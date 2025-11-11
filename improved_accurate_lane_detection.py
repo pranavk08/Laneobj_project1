@@ -12,6 +12,12 @@ class ImprovedLaneDetector:
         self.prev_left_fit = None
         self.prev_right_fit = None
         self.lane_center_offset = 0
+        
+        # Real-world conversion factors (US highway standard)
+        # Assuming lane width is ~3.7 meters (12 feet)
+        self.ym_per_pix = 30 / 720  # meters per pixel in y dimension
+        self.xm_per_pix = 3.7 / 700  # meters per pixel in x dimension
+        
         self.setup_perspective_transform()
     
     def setup_perspective_transform(self):
@@ -172,8 +178,8 @@ class ImprovedLaneDetector:
         
         return left_fit, right_fit
     
-    def calculate_lane_center_offset(self, left_fit, right_fit, img_height):
-        """Calculate vehicle offset from lane center"""
+    def calculate_lane_measurements(self, left_fit, right_fit, img_height):
+        """Calculate lane measurements including width and distance to edges"""
         # Calculate lane positions at bottom of image
         y_eval = img_height - 1
         left_lane_bottom = left_fit[0] * y_eval**2 + left_fit[1] * y_eval + left_fit[2]
@@ -188,7 +194,80 @@ class ImprovedLaneDetector:
         # Offset in pixels (positive = vehicle is right of center, negative = left of center)
         offset_pixels = vehicle_center - lane_center
         
-        return offset_pixels
+        # Calculate measurements in meters
+        lane_width_pixels = right_lane_bottom - left_lane_bottom
+        lane_width_meters = lane_width_pixels * self.xm_per_pix
+        
+        # Distance to left and right edges
+        distance_to_left = (vehicle_center - left_lane_bottom) * self.xm_per_pix
+        distance_to_right = (right_lane_bottom - vehicle_center) * self.xm_per_pix
+        
+        # Offset from center in meters
+        offset_meters = offset_pixels * self.xm_per_pix
+        
+        return {
+            'offset_pixels': offset_pixels,
+            'offset_meters': offset_meters,
+            'lane_width': lane_width_meters,
+            'distance_to_left': distance_to_left,
+            'distance_to_right': distance_to_right
+        }
+    
+    def draw_lane_measurements_panel(self, img, measurements):
+        """Draw lane measurements panel with distance and width info"""
+        # Panel position (top-right area)
+        panel_x = self.w - 380
+        panel_y = 20
+        panel_w = 360
+        panel_h = 180
+        
+        # Create semi-transparent panel background
+        overlay = img.copy()
+        cv2.rectangle(overlay, (panel_x, panel_y), 
+                     (panel_x + panel_w, panel_y + panel_h),
+                     (30, 30, 30), -1)
+        cv2.rectangle(overlay, (panel_x, panel_y), 
+                     (panel_x + panel_w, panel_y + panel_h),
+                     (255, 255, 255), 2)
+        img = cv2.addWeighted(img, 0.6, overlay, 0.4, 0)
+        
+        # Title
+        cv2.putText(img, "LANE MEASUREMENTS", (panel_x + 10, panel_y + 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        
+        # Draw separator line
+        cv2.line(img, (panel_x + 10, panel_y + 40), 
+                (panel_x + panel_w - 10, panel_y + 40), (100, 100, 100), 1)
+        
+        # Lane width
+        lane_width = measurements['lane_width']
+        cv2.putText(img, f"Lane Width: {lane_width:.2f} m", 
+                   (panel_x + 15, panel_y + 70),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Distance to left edge
+        dist_left = measurements['distance_to_left']
+        color_left = (0, 255, 255) if dist_left > 0.5 else (0, 165, 255)  # Yellow if safe, orange if close
+        cv2.putText(img, f"Left Edge: {dist_left:.2f} m", 
+                   (panel_x + 15, panel_y + 100),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_left, 2)
+        
+        # Distance to right edge
+        dist_right = measurements['distance_to_right']
+        color_right = (0, 255, 0) if dist_right > 0.5 else (0, 165, 255)  # Green if safe, orange if close
+        cv2.putText(img, f"Right Edge: {dist_right:.2f} m", 
+                   (panel_x + 15, panel_y + 130),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_right, 2)
+        
+        # Center offset
+        offset = measurements['offset_meters']
+        direction = "RIGHT" if offset > 0 else "LEFT" if offset < 0 else "CENTER"
+        offset_color = (0, 255, 0) if abs(offset) < 0.2 else (0, 255, 255)
+        cv2.putText(img, f"Offset: {abs(offset):.2f} m {direction}", 
+                   (panel_x + 15, panel_y + 160),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, offset_color, 2)
+        
+        return img
     
     def draw_direction_arrow(self, img, offset_pixels):
         """Draw directional arrow based on lane offset"""
@@ -223,7 +302,7 @@ class ImprovedLaneDetector:
         
         return img
     
-    def create_birds_eye_view(self, binary_warped, left_fit, right_fit, size=(300, 400)):
+    def create_birds_eye_view(self, binary_warped, left_fit, right_fit, size=(200, 280)):
         """Create mini bird's eye view visualization"""
         mini_w, mini_h = size
         
@@ -305,9 +384,9 @@ class ImprovedLaneDetector:
         left_fitx = left_fit[0] * ploty**2 + left_fit[1] * ploty + left_fit[2]
         right_fitx = right_fit[0] * ploty**2 + right_fit[1] * ploty + right_fit[2]
         
-        # Calculate lane center offset
-        offset_pixels = self.calculate_lane_center_offset(left_fit, right_fit, binary_warped.shape[0])
-        self.lane_center_offset = offset_pixels
+        # Calculate lane measurements
+        measurements = self.calculate_lane_measurements(left_fit, right_fit, binary_warped.shape[0])
+        self.lane_center_offset = measurements['offset_pixels']
         
         # Create overlay
         warp_zero = np.zeros_like(binary_warped).astype(np.uint8)
@@ -346,11 +425,11 @@ class ImprovedLaneDetector:
         # Create and overlay mini bird's eye view
         birds_eye = self.create_birds_eye_view(binary_warped, left_fit, right_fit)
         
-        # Position in bottom right corner
+        # Position in bottom left corner (to avoid measurements panel)
         bev_h, bev_w = birds_eye.shape[:2]
         margin = 20
         y_offset = self.h - bev_h - margin
-        x_offset = self.w - bev_w - margin
+        x_offset = margin
         
         # Add semi-transparent background
         overlay = result.copy()
@@ -362,6 +441,9 @@ class ImprovedLaneDetector:
         
         # Overlay the bird's eye view
         result[y_offset:y_offset + bev_h, x_offset:x_offset + bev_w] = birds_eye
+        
+        # Draw lane measurements panel
+        result = self.draw_lane_measurements_panel(result, measurements)
         
         return result
     
