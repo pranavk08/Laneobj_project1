@@ -22,39 +22,61 @@ def draw_output(
     lane_width_ft: Optional[float] = None,
 ):
     out = img.copy()
-    color = (0, 255, 0) if ground_conf >= 0.5 else (0, 0, 255)
+    import numpy as np
+    h = out.shape[0]
+    yb = h
     
-    # Draw filled lane area if we have 2 lanes
+    # Identify the driving lane (main lane - typically the center two lines)
+    driving_lane_indices = []
     if len(lanes) >= 2:
-        h = out.shape[0]
-        yt = int(0.6 * h)
-        yb = h
+        # Find the two lanes closest to center
+        w = out.shape[1]
+        center_x = w // 2
+        lane_distances = [(i, abs(_x_at_y(lane, yb) - center_x)) for i, lane in enumerate(lanes)]
+        lane_distances.sort(key=lambda x: x[1])
         
-        left, right = lanes[0], lanes[1]
+        # The two closest lanes to center are the driving lanes
+        if len(lane_distances) >= 2:
+            driving_lane_indices = sorted([lane_distances[0][0], lane_distances[1][0]])
+    
+    # Draw filled area for driving lane
+    if len(driving_lane_indices) == 2:
+        yt = int(0.6 * h)
+        
+        left_idx, right_idx = driving_lane_indices
+        left, right = lanes[left_idx], lanes[right_idx]
+        
         # Ensure left is left at bottom
         if _x_at_y(left, yb) > _x_at_y(right, yb):
             left, right = right, left
         
         # Create points for filled polygon
         pts = []
-        # Left line from bottom to top
         x1_b, y1_b, x1_t, y1_t = left
         pts.append([x1_b, y1_b])
         pts.append([x1_t, y1_t])
-        # Right line from top to bottom
         x2_b, y2_b, x2_t, y2_t = right
         pts.append([x2_t, y2_t])
         pts.append([x2_b, y2_b])
         
-        # Draw semi-transparent fill
-        import numpy as np
+        # Draw semi-transparent fill for driving lane
         overlay = out.copy()
         cv2.fillPoly(overlay, [np.array(pts, dtype=np.int32)], (0, 255, 255))  # Yellow fill
         cv2.addWeighted(overlay, 0.3, out, 0.7, 0, out)
     
-    # Draw lane lines on top
-    for x1, y1, x2, y2 in lanes:
-        cv2.line(out, (x1, y1), (x2, y2), color, 5)
+    # Draw all lane lines with different colors
+    for i, (x1, y1, x2, y2) in enumerate(lanes):
+        # Determine lane type and color
+        if i in driving_lane_indices:
+            # Driving lane boundaries - green (safe) or red (unsafe)
+            color = (0, 255, 0) if ground_conf >= 0.5 else (0, 0, 255)
+            thickness = 5
+        else:
+            # Side lanes - blue with lighter weight
+            color = (255, 150, 0)  # Orange/cyan for side lanes
+            thickness = 3
+        
+        cv2.line(out, (x1, y1), (x2, y2), color, thickness)
 
     # Draw interior center lines if we have a scale in feet and lane width
     if pixels_per_foot and lane_width_ft and len(lanes) >= 2 and pixels_per_foot > 0:
@@ -75,11 +97,10 @@ def draw_output(
             x_t = int(round(_x_at_y(left, yt) + frac * (_x_at_y(right, yt) - _x_at_y(left, yt))))
             cv2.line(out, (x_b, yb), (x_t, yt), (0, 255, 255), 2)  # yellow center lines
 
-    # Annotate measured lane/road width
-    h = out.shape[0]
-    yb = h
-    if len(lanes) >= 2:
-        left, right = lanes[0], lanes[1]
+    # Annotate measured lane/road width (driving lane only)
+    if len(driving_lane_indices) == 2:
+        left_idx, right_idx = driving_lane_indices
+        left, right = lanes[left_idx], lanes[right_idx]
         if _x_at_y(left, yb) > _x_at_y(right, yb):
             left, right = right, left
         dx_px = max(0.0, _x_at_y(right, yb) - _x_at_y(left, yb))

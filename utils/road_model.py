@@ -121,6 +121,126 @@ def _order_left_right(lines: List[Line], y: int) -> Tuple[Optional[Line], Option
     return left, right
 
 
+def _detect_all_lanes(
+    binary: np.ndarray,
+    histogram: np.ndarray,
+    h: int,
+    w: int,
+    max_lanes: int = 6,
+) -> List[Line]:
+    """
+    Detect multiple lane lines across the entire road width.
+    Returns list of lane lines sorted left to right.
+    """
+    # Find all peaks in histogram that could be lane markers
+    try:
+        from scipy.signal import find_peaks
+        
+        # Find peaks with minimum height and distance
+        min_peak_height = np.max(histogram) * 0.15  # 15% of max
+        min_distance = int(w * 0.08)  # Minimum 8% of width between lanes
+        
+        peaks, properties = find_peaks(histogram, height=min_peak_height, distance=min_distance)
+    except ImportError:
+        # Fallback: simple peak detection without scipy
+        min_peak_height = np.max(histogram) * 0.15
+        min_distance = int(w * 0.08)
+        
+        peaks = []
+        i = 0
+        while i < len(histogram):
+            if histogram[i] > min_peak_height:
+                # Find local maximum
+                peak_i = i
+                while i < len(histogram) - 1 and histogram[i + 1] >= histogram[i]:
+                    i += 1
+                    if histogram[i] > histogram[peak_i]:
+                        peak_i = i
+                
+                # Add peak if it's far enough from previous peaks
+                if not peaks or (peak_i - peaks[-1]) >= min_distance:
+                    peaks.append(peak_i)
+                
+                i += min_distance  # Skip ahead
+            else:
+                i += 1
+        
+        peaks = np.array(peaks)
+    
+    if len(peaks) == 0:
+        return []
+    
+    # Limit to max_lanes
+    if len(peaks) > max_lanes:
+        # Keep the strongest peaks
+        peak_heights = histogram[peaks]
+        top_indices = np.argsort(peak_heights)[-max_lanes:]
+        peaks = peaks[top_indices]
+        peaks = np.sort(peaks)  # Sort left to right
+    
+    # For each peak, run sliding window to detect lane line
+    nonzero = binary.nonzero()
+    nonzeroy = np.array(nonzero[0])
+    nonzerox = np.array(nonzero[1])
+    
+    nwindows = 9
+    window_height = int(h / nwindows)
+    margin = max(int(w * 0.04), 50)
+    minpix = 30
+    
+    detected_lanes = []
+    
+    for peak_x in peaks:
+        # Track this lane line through sliding windows
+        lane_inds = []
+        current_x = peak_x
+        
+        for window in range(nwindows):
+            win_y_low = h - (window + 1) * window_height
+            win_y_high = h - window * window_height
+            win_x_low = current_x - margin
+            win_x_high = current_x + margin
+            
+            good_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
+                        (nonzerox >= win_x_low) & (nonzerox < win_x_high)).nonzero()[0]
+            
+            lane_inds.append(good_inds)
+            
+            if len(good_inds) > minpix:
+                new_x = int(np.mean(nonzerox[good_inds]))
+                # Prevent jumping too far
+                if abs(new_x - current_x) < w * 0.08:
+                    current_x = new_x
+        
+        lane_inds = np.concatenate(lane_inds) if lane_inds else np.array([], dtype=int)
+        
+        if len(lane_inds) < 30:
+            continue
+        
+        lane_x = nonzerox[lane_inds]
+        lane_y = nonzeroy[lane_inds]
+        
+        try:
+            # Fit polynomial
+            fit = np.polyfit(lane_y, lane_x, 2)
+            
+            y_bottom = h
+            y_top = int(h * 0.6)
+            
+            x_bottom = int(fit[0] * y_bottom**2 + fit[1] * y_bottom + fit[2])
+            x_top = int(fit[0] * y_top**2 + fit[1] * y_top + fit[2])
+            
+            if 0 <= x_bottom < w and 0 <= x_top < w:
+                detected_lanes.append((x_bottom, y_bottom, x_top, y_top))
+        except (np.RankWarning, TypeError, ValueError):
+            continue
+    
+    # Sort lanes left to right
+    detected_lanes.sort(key=lambda lane: lane[0])
+    
+    return detected_lanes
+
+
 def estimate_lanes(
     seg: np.ndarray,
     depth: Optional[np.ndarray],
@@ -128,11 +248,13 @@ def estimate_lanes(
     target_width_in: Optional[float] = None,
     pixels_per_inch: Optional[float] = None,
     width_tolerance_in: float = 0.5,
+    detect_side_lanes: bool = True,
+    max_lanes: int = 6,
 ) -> List[Line]:
     """
     Estimate lane lines and optionally enforce a target lane width (in inches) when a
     pixel-to-inch scale is provided.
-    Returns a list of 2 line segments [(x1,y1,x2,y2), ...].
+    Returns a list of line segments [(x1,y1,x2,y2), ...], including side lanes if enabled.
     """
     # Sliding-window polynomial fit for lane lines
     if bgr_image is None:
@@ -352,6 +474,31 @@ def estimate_lanes(
                     lanes = [left_line, adjusted_right]
                     right_line = adjusted_right
 
+    # Detect additional side lanes if enabled
+    if detect_side_lanes and len(lanes) >= 2:
+        # Try to detect all lanes across the full road width
+        all_lanes = _detect_all_lanes(binary, histogram, h, w, max_lanes=max_lanes)
+        
+        if len(all_lanes) > 2:
+            # We found additional lanes beyond the main driving lane
+            # Keep the main driving lanes and add side lanes
+            driving_left, driving_right = lanes[0], lanes[1]
+            driving_left_x = _x_at_y(driving_left, h)
+            driving_right_x = _x_at_y(driving_right, h)
+            
+            # Add lanes that are outside the driving lane boundaries
+            for lane in all_lanes:
+                lane_x = _x_at_y(lane, h)
+                # Check if this lane is significantly different from driving lanes
+                if lane_x < driving_left_x - w * 0.05:  # Left side lane
+                    lanes.append(lane)
+                elif lane_x > driving_right_x + w * 0.05:  # Right side lane
+                    lanes.append(lane)
+            
+            # Remove duplicates and sort
+            lanes = list(set(lanes))
+            lanes.sort(key=lambda lane: lane[0])
+    
     # Ensure output ordered left, right at bottom
     left, right = _order_left_right(lanes, h)
     lanes_out: List[Line] = []
@@ -359,4 +506,9 @@ def estimate_lanes(
         lanes_out.append(left)
     if right is not None and (not lanes_out or right != lanes_out[0]):
         lanes_out.append(right)
+    
+    # If we have side lanes, add all detected lanes instead of just left/right
+    if detect_side_lanes and len(lanes) > 2:
+        lanes_out = sorted(lanes, key=lambda lane: lane[0])
+    
     return lanes_out

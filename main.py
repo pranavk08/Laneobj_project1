@@ -16,7 +16,7 @@ from collections import defaultdict
 from ultralytics import YOLO
 
 # Import lane detection
-from accurate_lane_detection import LaneDetector
+from improved_accurate_lane_detection import ImprovedLaneDetector as LaneDetector
 
 
 class ObjectTracker:

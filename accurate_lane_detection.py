@@ -10,28 +10,31 @@ import time
 
 
 class LaneDetector:
-    def __init__(self, img_shape):
+    def __init__(self, img_shape, detect_side_lanes=True, max_lanes=6):
         self.h, self.w = img_shape[:2]
         self.prev_left_fit = None
         self.prev_right_fit = None
+        self.detect_side_lanes = detect_side_lanes
+        self.max_lanes = max_lanes
+        self.prev_lane_fits = []  # Store all lane polynomials
         self.setup_perspective_transform()
     
     def setup_perspective_transform(self):
         """Setup perspective transform for bird's eye view"""
-        # Source points (trapezoid in original view)
+        # Source points (trapezoid in original view) - adjusted for tighter lane detection
         src = np.float32([
-            [self.w * 0.45, self.h * 0.63],  # top left
-            [self.w * 0.55, self.h * 0.63],  # top right
-            [self.w * 0.9, self.h],          # bottom right
-            [self.w * 0.1, self.h]           # bottom left
+            [self.w * 0.46, self.h * 0.60],  # top left
+            [self.w * 0.54, self.h * 0.60],  # top right
+            [self.w * 0.85, self.h * 0.95],  # bottom right
+            [self.w * 0.15, self.h * 0.95]   # bottom left
         ])
         
         # Destination points (rectangle in bird's eye view)
         dst = np.float32([
-            [self.w * 0.2, 0],
-            [self.w * 0.8, 0],
-            [self.w * 0.8, self.h],
-            [self.w * 0.2, self.h]
+            [self.w * 0.25, 0],
+            [self.w * 0.75, 0],
+            [self.w * 0.75, self.h],
+            [self.w * 0.25, self.h]
         ])
         
         self.M = cv2.getPerspectiveTransform(src, dst)
@@ -66,6 +69,40 @@ class LaneDetector:
         combined[(white_combined > 0) | (yellow_combined > 0) | (sobel_binary > 0)] = 255
         
         return combined
+    
+    def find_all_lane_peaks(self, histogram):
+        """Find all lane line peaks in histogram for multi-lane detection"""
+        peaks = []
+        min_peak_height = np.max(histogram) * 0.12  # 12% of max
+        min_distance = int(len(histogram) * 0.08)  # 8% of width
+        
+        # Simple peak detection
+        i = int(len(histogram) * 0.05)  # Start from 5% of width
+        while i < int(len(histogram) * 0.95):  # End at 95% of width
+            if histogram[i] > min_peak_height:
+                # Find local maximum
+                peak_i = i
+                while i < len(histogram) - 1 and histogram[i + 1] >= histogram[i]:
+                    i += 1
+                    if histogram[i] > histogram[peak_i]:
+                        peak_i = i
+                
+                # Add peak if it's far enough from previous peaks
+                if not peaks or (peak_i - peaks[-1]) >= min_distance:
+                    peaks.append(peak_i)
+                
+                i += min_distance  # Skip ahead
+            else:
+                i += 1
+        
+        # Limit to max_lanes
+        if len(peaks) > self.max_lanes:
+            # Keep the strongest peaks
+            peak_heights = [histogram[p] for p in peaks]
+            top_indices = np.argsort(peak_heights)[-self.max_lanes:]
+            peaks = [peaks[i] for i in sorted(top_indices)]
+        
+        return peaks
     
     def find_lane_pixels_sliding_window(self, binary_warped):
         """Sliding window search from scratch"""
@@ -125,6 +162,60 @@ class LaneDetector:
         
         return leftx, lefty, rightx, righty
     
+    def find_all_lane_pixels(self, binary_warped):
+        """Find pixels for all lanes across the road width"""
+        # Histogram of bottom half
+        histogram = np.sum(binary_warped[binary_warped.shape[0]//2:, :], axis=0)
+        
+        # Find all lane peaks
+        peaks = self.find_all_lane_peaks(histogram)
+        
+        if len(peaks) == 0:
+            return []
+        
+        # Window settings
+        nwindows = 9
+        margin = 80
+        minpix = 40
+        
+        window_height = binary_warped.shape[0] // nwindows
+        nonzero = binary_warped.nonzero()
+        nonzeroy = np.array(nonzero[0])
+        nonzerox = np.array(nonzero[1])
+        
+        all_lanes = []
+        
+        # Track each lane line
+        for peak_x in peaks:
+            lane_inds = []
+            current_x = peak_x
+            
+            for window in range(nwindows):
+                win_y_low = binary_warped.shape[0] - (window + 1) * window_height
+                win_y_high = binary_warped.shape[0] - window * window_height
+                win_x_low = current_x - margin
+                win_x_high = current_x + margin
+                
+                good_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
+                            (nonzerox >= win_x_low) & (nonzerox < win_x_high)).nonzero()[0]
+                
+                lane_inds.append(good_inds)
+                
+                if len(good_inds) > minpix:
+                    new_x = int(np.mean(nonzerox[good_inds]))
+                    # Prevent jumping too far
+                    if abs(new_x - current_x) < binary_warped.shape[1] * 0.08:
+                        current_x = new_x
+            
+            lane_inds = np.concatenate(lane_inds) if lane_inds else np.array([], dtype=int)
+            
+            if len(lane_inds) > 100:
+                lane_x = nonzerox[lane_inds]
+                lane_y = nonzeroy[lane_inds]
+                all_lanes.append((lane_x, lane_y))
+        
+        return all_lanes
+    
     def fit_polynomial(self, leftx, lefty, rightx, righty):
         """Fit 2nd order polynomial with smoothing"""
         if len(leftx) > 100:
@@ -168,16 +259,86 @@ class LaneDetector:
         # Draw the lane
         cv2.fillPoly(color_warp, np.int_([pts]), (0, 255, 0))
         
-        # Draw lane lines
+        # Draw lane lines (Yellow left, Red right)
         for i in range(len(ploty)-1):
             cv2.line(color_warp, 
                     (int(left_fitx[i]), int(ploty[i])), 
                     (int(left_fitx[i+1]), int(ploty[i+1])), 
-                    (255, 0, 0), 10)
+                    (0, 255, 255), 10)  # Yellow (BGR: 0, 255, 255)
             cv2.line(color_warp, 
                     (int(right_fitx[i]), int(ploty[i])), 
                     (int(right_fitx[i+1]), int(ploty[i+1])), 
-                    (0, 0, 255), 10)
+                    (0, 0, 255), 10)  # Red (BGR: 0, 0, 255)
+        
+        # Warp back to original image space
+        newwarp = cv2.warpPerspective(color_warp, self.Minv, (img.shape[1], img.shape[0]))
+        
+        # Combine with original image
+        result = cv2.addWeighted(img, 1, newwarp, 0.3, 0)
+        
+        return result
+    
+    def draw_all_lanes(self, img, binary_warped, lane_fits):
+        """Draw all detected lanes including side lanes"""
+        # Generate y values
+        ploty = np.linspace(0, binary_warped.shape[0]-1, binary_warped.shape[0])
+        
+        # Create an image to draw the lines on
+        warp_zero = np.zeros_like(binary_warped).astype(np.uint8)
+        color_warp = np.dstack((warp_zero, warp_zero, warp_zero))
+        
+        if len(lane_fits) == 0:
+            return img
+        
+        # Calculate all lane x positions at bottom
+        lane_x_bottom = []
+        for fit in lane_fits:
+            x_bottom = fit[0]*ploty[-1]**2 + fit[1]*ploty[-1] + fit[2]
+            lane_x_bottom.append(x_bottom)
+        
+        # Find center two lanes (driving lane)
+        center_x = binary_warped.shape[1] / 2
+        distances_to_center = [abs(x - center_x) for x in lane_x_bottom]
+        sorted_indices = np.argsort(distances_to_center)
+        
+        driving_lane_indices = set()
+        if len(sorted_indices) >= 2:
+            driving_lane_indices = {sorted_indices[0], sorted_indices[1]}
+            # Ensure left is left and right is right
+            idx1, idx2 = sorted_indices[0], sorted_indices[1]
+            if lane_x_bottom[idx1] > lane_x_bottom[idx2]:
+                idx1, idx2 = idx2, idx1
+            
+            # Draw filled driving lane area
+            left_fitx = lane_fits[idx1][0]*ploty**2 + lane_fits[idx1][1]*ploty + lane_fits[idx1][2]
+            right_fitx = lane_fits[idx2][0]*ploty**2 + lane_fits[idx2][1]*ploty + lane_fits[idx2][2]
+            
+            pts_left = np.array([np.transpose(np.vstack([left_fitx, ploty]))])
+            pts_right = np.array([np.flipud(np.transpose(np.vstack([right_fitx, ploty])))])
+            pts = np.hstack((pts_left, pts_right))
+            
+            cv2.fillPoly(color_warp, np.int_([pts]), (0, 255, 0))  # Green fill
+        
+        # Draw all lane lines
+        for i, fit in enumerate(lane_fits):
+            fitx = fit[0]*ploty**2 + fit[1]*ploty + fit[2]
+            
+            # Determine color based on lane type
+            if i in driving_lane_indices:
+                # Driving lane boundaries - thicker lines
+                color = (0, 255, 255)  # Yellow for main lanes
+                thickness = 12
+            else:
+                # Side lanes - thinner orange lines
+                color = (0, 165, 255)  # Orange for side lanes
+                thickness = 8
+            
+            # Draw the lane line
+            for j in range(len(ploty)-1):
+                cv2.line(color_warp, 
+                        (int(fitx[j]), int(ploty[j])), 
+                        (int(fitx[j+1]), int(ploty[j+1])), 
+                        color, thickness)
         
         # Warp back to original image space
         newwarp = cv2.warpPerspective(color_warp, self.Minv, (img.shape[1], img.shape[0]))
