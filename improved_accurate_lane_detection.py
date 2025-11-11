@@ -11,6 +11,7 @@ class ImprovedLaneDetector:
         self.h, self.w = img_shape[:2]
         self.prev_left_fit = None
         self.prev_right_fit = None
+        self.lane_center_offset = 0
         self.setup_perspective_transform()
     
     def setup_perspective_transform(self):
@@ -171,6 +172,130 @@ class ImprovedLaneDetector:
         
         return left_fit, right_fit
     
+    def calculate_lane_center_offset(self, left_fit, right_fit, img_height):
+        """Calculate vehicle offset from lane center"""
+        # Calculate lane positions at bottom of image
+        y_eval = img_height - 1
+        left_lane_bottom = left_fit[0] * y_eval**2 + left_fit[1] * y_eval + left_fit[2]
+        right_lane_bottom = right_fit[0] * y_eval**2 + right_fit[1] * y_eval + right_fit[2]
+        
+        # Lane center
+        lane_center = (left_lane_bottom + right_lane_bottom) / 2
+        
+        # Vehicle center (assume camera is at center)
+        vehicle_center = self.w / 2
+        
+        # Offset in pixels (positive = vehicle is right of center, negative = left of center)
+        offset_pixels = vehicle_center - lane_center
+        
+        return offset_pixels
+    
+    def draw_direction_arrow(self, img, offset_pixels):
+        """Draw directional arrow based on lane offset"""
+        # Threshold for showing arrow (in pixels)
+        threshold = 30
+        
+        # Arrow position
+        arrow_y = int(self.h * 0.3)  # 30% from top
+        arrow_x = int(self.w / 2)
+        
+        if abs(offset_pixels) > threshold:
+            if offset_pixels > 0:  # Vehicle is right of center, show left arrow
+                direction = "LEFT"
+                # Draw left arrow
+                arrow_color = (0, 255, 255)  # Yellow
+                cv2.arrowedLine(img, (arrow_x + 80, arrow_y), (arrow_x + 20, arrow_y),
+                              arrow_color, 8, tipLength=0.5)
+                cv2.putText(img, "STEER LEFT", (arrow_x - 60, arrow_y + 50),
+                          cv2.FONT_HERSHEY_SIMPLEX, 1.2, arrow_color, 3)
+            else:  # Vehicle is left of center, show right arrow
+                direction = "RIGHT"
+                # Draw right arrow
+                arrow_color = (0, 255, 255)  # Yellow
+                cv2.arrowedLine(img, (arrow_x - 80, arrow_y), (arrow_x - 20, arrow_y),
+                              arrow_color, 8, tipLength=0.5)
+                cv2.putText(img, "STEER RIGHT", (arrow_x - 70, arrow_y + 50),
+                          cv2.FONT_HERSHEY_SIMPLEX, 1.2, arrow_color, 3)
+        else:
+            # Centered - show checkmark or "OK"
+            cv2.putText(img, "CENTERED", (arrow_x - 90, arrow_y),
+                      cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+        
+        return img
+    
+    def create_birds_eye_view(self, binary_warped, left_fit, right_fit, size=(300, 400)):
+        """Create mini bird's eye view visualization"""
+        mini_w, mini_h = size
+        
+        # Create blank canvas
+        birds_eye = np.zeros((mini_h, mini_w, 3), dtype=np.uint8)
+        birds_eye[:] = (40, 40, 40)  # Dark gray background
+        
+        # Generate y values for the mini view
+        ploty = np.linspace(0, mini_h - 1, mini_h)
+        
+        # Scale factors to fit warped view into mini view
+        scale_x = mini_w / binary_warped.shape[1]
+        scale_y = mini_h / binary_warped.shape[0]
+        
+        # Calculate lane positions scaled to mini view
+        left_fitx = (left_fit[0] * (ploty / scale_y)**2 + 
+                     left_fit[1] * (ploty / scale_y) + 
+                     left_fit[2]) * scale_x
+        right_fitx = (right_fit[0] * (ploty / scale_y)**2 + 
+                      right_fit[1] * (ploty / scale_y) + 
+                      right_fit[2]) * scale_x
+        
+        # Clip values to prevent out of bounds
+        left_fitx = np.clip(left_fitx, 0, mini_w - 1)
+        right_fitx = np.clip(right_fitx, 0, mini_w - 1)
+        
+        # Create lane polygon
+        pts_left = np.array([np.transpose(np.vstack([left_fitx, ploty]))], dtype=np.int32)
+        pts_right = np.array([np.flipud(np.transpose(np.vstack([right_fitx, ploty])))], dtype=np.int32)
+        pts = np.hstack((pts_left, pts_right))
+        
+        # Fill lane area (green)
+        cv2.fillPoly(birds_eye, pts, (0, 200, 0))
+        
+        # Draw lane edges
+        for i in range(len(ploty) - 1):
+            # Left edge (yellow)
+            cv2.line(birds_eye,
+                    (int(left_fitx[i]), int(ploty[i])),
+                    (int(left_fitx[i + 1]), int(ploty[i + 1])),
+                    (0, 255, 255), 2)
+            # Right edge (red)
+            cv2.line(birds_eye,
+                    (int(right_fitx[i]), int(ploty[i])),
+                    (int(right_fitx[i + 1]), int(ploty[i + 1])),
+                    (0, 0, 255), 2)
+        
+        # Draw vehicle position indicator (white triangle at bottom center)
+        vehicle_x = mini_w // 2
+        vehicle_y = mini_h - 20
+        triangle = np.array([
+            [vehicle_x, vehicle_y - 15],
+            [vehicle_x - 10, vehicle_y + 5],
+            [vehicle_x + 10, vehicle_y + 5]
+        ], dtype=np.int32)
+        cv2.fillPoly(birds_eye, [triangle], (255, 255, 255))
+        cv2.polylines(birds_eye, [triangle], True, (0, 255, 0), 2)
+        
+        # Draw center line (dashed)
+        center_x = mini_w // 2
+        for y in range(0, mini_h, 20):
+            cv2.line(birds_eye, (center_x, y), (center_x, y + 10), (150, 150, 150), 1)
+        
+        # Add border
+        cv2.rectangle(birds_eye, (0, 0), (mini_w - 1, mini_h - 1), (255, 255, 255), 2)
+        
+        # Add title
+        cv2.putText(birds_eye, "Bird's Eye View", (10, 25),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        return birds_eye
+    
     def draw_lane(self, img, binary_warped, left_fit, right_fit):
         """Draw detected lane with gradient edges matching desired output"""
         # Generate y values
@@ -179,6 +304,10 @@ class ImprovedLaneDetector:
         # Calculate x values
         left_fitx = left_fit[0] * ploty**2 + left_fit[1] * ploty + left_fit[2]
         right_fitx = right_fit[0] * ploty**2 + right_fit[1] * ploty + right_fit[2]
+        
+        # Calculate lane center offset
+        offset_pixels = self.calculate_lane_center_offset(left_fit, right_fit, binary_warped.shape[0])
+        self.lane_center_offset = offset_pixels
         
         # Create overlay
         warp_zero = np.zeros_like(binary_warped).astype(np.uint8)
@@ -213,6 +342,26 @@ class ImprovedLaneDetector:
         
         # Blend with original image - increase lane overlay visibility
         result = cv2.addWeighted(img, 1, newwarp, 0.5, 0)
+        
+        # Create and overlay mini bird's eye view
+        birds_eye = self.create_birds_eye_view(binary_warped, left_fit, right_fit)
+        
+        # Position in bottom right corner
+        bev_h, bev_w = birds_eye.shape[:2]
+        margin = 20
+        y_offset = self.h - bev_h - margin
+        x_offset = self.w - bev_w - margin
+        
+        # Add semi-transparent background
+        overlay = result.copy()
+        cv2.rectangle(overlay, 
+                     (x_offset - 5, y_offset - 5), 
+                     (x_offset + bev_w + 5, y_offset + bev_h + 5),
+                     (0, 0, 0), -1)
+        result = cv2.addWeighted(result, 0.7, overlay, 0.3, 0)
+        
+        # Overlay the bird's eye view
+        result[y_offset:y_offset + bev_h, x_offset:x_offset + bev_w] = birds_eye
         
         return result
     
