@@ -205,13 +205,111 @@ class ImprovedLaneDetector:
         # Offset from center in meters
         offset_meters = offset_pixels * self.xm_per_pix
         
+        # Calculate curvature radius
+        curvature_radius = self.calculate_curvature(left_fit, right_fit, img_height)
+        
         return {
             'offset_pixels': offset_pixels,
             'offset_meters': offset_meters,
             'lane_width': lane_width_meters,
             'distance_to_left': distance_to_left,
-            'distance_to_right': distance_to_right
+            'distance_to_right': distance_to_right,
+            'curvature_radius': curvature_radius
         }
+    
+    def calculate_curvature(self, left_fit, right_fit, img_height):
+        """Calculate radius of curvature of the lane"""
+        y_eval = img_height - 1
+        
+        # Convert polynomial coefficients to real-world space
+        left_fit_cr = np.polyfit(np.array([0, img_height]) * self.ym_per_pix, 
+                                 np.array([left_fit[2], left_fit[0] * img_height**2 + 
+                                          left_fit[1] * img_height + left_fit[2]]) * self.xm_per_pix, 2)
+        right_fit_cr = np.polyfit(np.array([0, img_height]) * self.ym_per_pix,
+                                  np.array([right_fit[2], right_fit[0] * img_height**2 + 
+                                           right_fit[1] * img_height + right_fit[2]]) * self.xm_per_pix, 2)
+        
+        # Calculate radius of curvature
+        y_eval_m = y_eval * self.ym_per_pix
+        left_curverad = ((1 + (2 * left_fit_cr[0] * y_eval_m + left_fit_cr[1])**2)**1.5) / np.abs(2 * left_fit_cr[0])
+        right_curverad = ((1 + (2 * right_fit_cr[0] * y_eval_m + right_fit_cr[1])**2)**1.5) / np.abs(2 * right_fit_cr[0])
+        
+        # Average curvature
+        curvature = (left_curverad + right_curverad) / 2
+        
+        return curvature
+    
+    def calculate_recommended_speed(self, curvature_radius, lane_width, offset_meters):
+        """Calculate recommended speed based on road conditions"""
+        # Base speed on curvature
+        if curvature_radius > 5000:  # Nearly straight
+            base_speed = 120  # km/h
+            road_type = "Straight"
+        elif curvature_radius > 1500:  # Gentle curve
+            base_speed = 100
+            road_type = "Gentle Curve"
+        elif curvature_radius > 800:  # Moderate curve
+            base_speed = 80
+            road_type = "Moderate Curve"
+        elif curvature_radius > 400:  # Sharp curve
+            base_speed = 60
+            road_type = "Sharp Curve"
+        else:  # Very sharp curve
+            base_speed = 40
+            road_type = "Sharp Curve"
+        
+        # Adjust for lane position (if drifting, reduce speed)
+        if abs(offset_meters) > 0.5:
+            base_speed *= 0.85  # Reduce by 15%
+        
+        # Adjust for narrow lanes
+        if lane_width < 3.2:
+            base_speed *= 0.9  # Reduce by 10%
+        
+        return int(base_speed), road_type
+    
+    def draw_speed_recommendation_panel(self, img, measurements):
+        """Draw speed recommendation panel"""
+        # Panel position (center top) - compact size
+        panel_w = 240
+        panel_h = 90
+        panel_x = (self.w - panel_w) // 2  # Center horizontally
+        panel_y = 20
+        
+        curvature = measurements['curvature_radius']
+        recommended_speed, road_type = self.calculate_recommended_speed(
+            curvature, measurements['lane_width'], measurements['offset_meters']
+        )
+        
+        # Create semi-transparent panel background
+        overlay = img.copy()
+        cv2.rectangle(overlay, (panel_x, panel_y), 
+                     (panel_x + panel_w, panel_y + panel_h),
+                     (30, 30, 30), -1)
+        cv2.rectangle(overlay, (panel_x, panel_y), 
+                     (panel_x + panel_w, panel_y + panel_h),
+                     (255, 255, 255), 2)
+        img = cv2.addWeighted(img, 0.6, overlay, 0.4, 0)
+        
+        # Title (compact)
+        cv2.putText(img, "SPEED", (panel_x + 10, panel_y + 25),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        
+        # Recommended speed (compact inline display)
+        speed_color = (0, 255, 0) if recommended_speed >= 80 else (0, 255, 255) if recommended_speed >= 60 else (0, 165, 255)
+        cv2.putText(img, f"{recommended_speed}", 
+                   (panel_x + 10, panel_y + 60),
+                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, speed_color, 2)
+        cv2.putText(img, "km/h", 
+                   (panel_x + 90, panel_y + 60),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Road type (inline)
+        cv2.putText(img, f"| {road_type}", 
+                   (panel_x + 10, panel_y + 80),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        
+        return img
     
     def draw_lane_measurements_panel(self, img, measurements):
         """Draw lane measurements panel with distance and width info"""
@@ -444,6 +542,9 @@ class ImprovedLaneDetector:
         
         # Draw lane measurements panel
         result = self.draw_lane_measurements_panel(result, measurements)
+        
+        # Draw speed recommendation panel
+        result = self.draw_speed_recommendation_panel(result, measurements)
         
         return result
     
