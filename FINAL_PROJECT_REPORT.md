@@ -1185,9 +1185,9 @@ This Advanced Lane Detection & Object Recognition System successfully achieves a
 
 ## 📧 Contact Information
 
-**Project Maintainer**: [Your Name]
-**Email**: [your.email@example.com]
-**GitHub**: [github.com/yourusername/laneobj_pro]
+**Project Maintainer**: [Pranav Kamble]
+**Email**: [pranavkamble346@gmail.com]
+**GitHub**: [https://github.com/pranavk08/Laneobj_project1]
 
 ---
 
