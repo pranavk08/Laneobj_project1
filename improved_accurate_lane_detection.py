@@ -18,6 +18,11 @@ class ImprovedLaneDetector:
         self.ym_per_pix = 30 / 720  # meters per pixel in y dimension
         self.xm_per_pix = 3.7 / 700  # meters per pixel in x dimension
         
+        # Accuracy tracking
+        self.total_frames = 0
+        self.successful_detections = 0
+        self.lane_detection_accuracy = 0.0
+        
         self.setup_perspective_transform()
     
     def setup_perspective_transform(self):
@@ -156,6 +161,8 @@ class ImprovedLaneDetector:
     
     def fit_polynomial(self, leftx, lefty, rightx, righty):
         """Fit polynomial with temporal smoothing"""
+        detection_successful = False
+        
         # Fit left lane
         if len(leftx) > 150:
             left_fit = np.polyfit(lefty, leftx, 2)
@@ -163,6 +170,7 @@ class ImprovedLaneDetector:
             if self.prev_left_fit is not None:
                 left_fit = 0.75 * self.prev_left_fit + 0.25 * left_fit
             self.prev_left_fit = left_fit
+            detection_successful = True
         else:
             left_fit = self.prev_left_fit if self.prev_left_fit is not None else [0, 0, self.w // 4]
         
@@ -173,8 +181,20 @@ class ImprovedLaneDetector:
             if self.prev_right_fit is not None:
                 right_fit = 0.75 * self.prev_right_fit + 0.25 * right_fit
             self.prev_right_fit = right_fit
+            if detection_successful:
+                detection_successful = True
         else:
             right_fit = self.prev_right_fit if self.prev_right_fit is not None else [0, 0, 3 * self.w // 4]
+            detection_successful = False
+        
+        # Update accuracy tracking
+        self.total_frames += 1
+        if detection_successful:
+            self.successful_detections += 1
+        
+        # Calculate accuracy
+        if self.total_frames > 0:
+            self.lane_detection_accuracy = (self.successful_detections / self.total_frames) * 100
         
         return left_fit, right_fit
     
@@ -270,9 +290,9 @@ class ImprovedLaneDetector:
     
     def draw_speed_recommendation_panel(self, img, measurements):
         """Draw speed recommendation panel"""
-        # Panel position (center top) - compact size
-        panel_w = 240
-        panel_h = 90
+        # Panel position (center top) - ultra compact size
+        panel_w = 140
+        panel_h = 55
         panel_x = (self.w - panel_w) // 2  # Center horizontally
         panel_y = 20
         
@@ -281,33 +301,28 @@ class ImprovedLaneDetector:
             curvature, measurements['lane_width'], measurements['offset_meters']
         )
         
-        # Create semi-transparent panel background
+        # Create darker, more opaque panel background
         overlay = img.copy()
         cv2.rectangle(overlay, (panel_x, panel_y), 
                      (panel_x + panel_w, panel_y + panel_h),
-                     (30, 30, 30), -1)
+                     (10, 10, 20), -1)  # Much darker background
         cv2.rectangle(overlay, (panel_x, panel_y), 
                      (panel_x + panel_w, panel_y + panel_h),
-                     (255, 255, 255), 2)
-        img = cv2.addWeighted(img, 0.6, overlay, 0.4, 0)
+                     (180, 180, 180), 2)  # Gray border
+        img = cv2.addWeighted(img, 0.3, overlay, 0.7, 0)  # More opaque
         
-        # Title (compact)
-        cv2.putText(img, "SPEED", (panel_x + 10, panel_y + 25),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        # Title (very small)
+        cv2.putText(img, "SPEED", (panel_x + 5, panel_y + 18),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
         
         # Recommended speed (compact inline display)
         speed_color = (0, 255, 0) if recommended_speed >= 80 else (0, 255, 255) if recommended_speed >= 60 else (0, 165, 255)
         cv2.putText(img, f"{recommended_speed}", 
-                   (panel_x + 10, panel_y + 60),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, speed_color, 2)
+                   (panel_x + 10, panel_y + 42),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, speed_color, 2)
         cv2.putText(img, "km/h", 
-                   (panel_x + 90, panel_y + 60),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        
-        # Road type (inline)
-        cv2.putText(img, f"| {road_type}", 
-                   (panel_x + 10, panel_y + 80),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                   (panel_x + 60, panel_y + 42),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         
         return img
     
@@ -319,19 +334,32 @@ class ImprovedLaneDetector:
         panel_w = 360
         panel_h = 180
         
-        # Create semi-transparent panel background
+        # Create semi-transparent panel background with gradient effect
         overlay = img.copy()
-        cv2.rectangle(overlay, (panel_x, panel_y), 
-                     (panel_x + panel_w, panel_y + panel_h),
-                     (30, 30, 30), -1)
-        cv2.rectangle(overlay, (panel_x, panel_y), 
-                     (panel_x + panel_w, panel_y + panel_h),
-                     (255, 255, 255), 2)
-        img = cv2.addWeighted(img, 0.6, overlay, 0.4, 0)
         
-        # Title
+        # Inner dark background
+        cv2.rectangle(overlay, (panel_x, panel_y), 
+                     (panel_x + panel_w, panel_y + panel_h),
+                     (20, 20, 30), -1)
+        
+        # Outer glow border (multiple rectangles for glow effect)
+        cv2.rectangle(overlay, (panel_x - 2, panel_y - 2), 
+                     (panel_x + panel_w + 2, panel_y + panel_h + 2),
+                     (0, 255, 255), 3)
+        cv2.rectangle(overlay, (panel_x - 1, panel_y - 1), 
+                     (panel_x + panel_w + 1, panel_y + panel_h + 1),
+                     (0, 200, 200), 2)
+        cv2.rectangle(overlay, (panel_x, panel_y), 
+                     (panel_x + panel_w, panel_y + panel_h),
+                     (0, 255, 255), 2)
+        
+        img = cv2.addWeighted(img, 0.5, overlay, 0.5, 0)
+        
+        # Title with glow effect
+        cv2.putText(img, "LANE MEASUREMENTS", (panel_x + 11, panel_y + 31),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 150, 150), 3)  # Shadow
         cv2.putText(img, "LANE MEASUREMENTS", (panel_x + 10, panel_y + 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)  # Main text
         
         # Draw separator line
         cv2.line(img, (panel_x + 10, panel_y + 40), 
@@ -567,3 +595,7 @@ class ImprovedLaneDetector:
         result = self.draw_lane(img, binary_warped, left_fit, right_fit)
         
         return result
+    
+    def get_accuracy(self):
+        """Get current lane detection accuracy"""
+        return self.lane_detection_accuracy

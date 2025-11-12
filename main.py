@@ -127,6 +127,11 @@ class DrivingAssistant:
         """
         self.conf_threshold = conf_threshold
         
+        # Distance estimation parameters
+        # Assume average car width is 1.8m and calibrate from that
+        self.avg_car_width_meters = 1.8
+        self.focal_length = 1000  # Calibrated focal length (pixels)
+        
         # Setup device
         if device == 'auto':
             self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -173,12 +178,46 @@ class DrivingAssistant:
             model = YOLO('yolov8s.pt')
             return model
     
+    def estimate_distance(self, bbox: tuple, class_name: str) -> float:
+        """
+        Estimate distance to object based on bounding box size
+        
+        Args:
+            bbox: Bounding box (x1, y1, x2, y2)
+            class_name: Object class name
+        
+        Returns:
+            Estimated distance in meters
+        """
+        x1, y1, x2, y2 = bbox
+        bbox_width = x2 - x1
+        bbox_height = y2 - y1
+        
+        # Known real-world dimensions (in meters)
+        known_widths = {
+            'car': 1.8,
+            'bus': 2.5,
+            'truck': 2.4,
+            'motorcycle': 0.8,
+            'person': 0.5
+        }
+        
+        real_width = known_widths.get(class_name, 1.8)
+        
+        # Distance formula: D = (Real_Width × Focal_Length) / Pixel_Width
+        if bbox_width > 0:
+            distance = (real_width * self.focal_length) / bbox_width
+        else:
+            distance = 0
+        
+        return distance
+    
     def detect_objects(self, frame: np.ndarray) -> List[Dict]:
         """
         Detect objects in frame
         
         Returns:
-            List of detections with bbox, class, confidence, center
+            List of detections with bbox, class, confidence, center, distance
         """
         # Run inference
         results = self.model(frame, conf=self.conf_threshold, verbose=False)[0]
@@ -200,16 +239,23 @@ class DrivingAssistant:
             cx = int((x1 + x2) / 2)
             cy = int((y1 + y2) / 2)
             
+            bbox = (int(x1), int(y1), int(x2), int(y2))
+            class_name = self.DETECTION_CLASSES[cls_id]
+            
+            # Estimate distance
+            distance = self.estimate_distance(bbox, class_name)
+            
             detection = {
-                'bbox': (int(x1), int(y1), int(x2), int(y2)),
+                'bbox': bbox,
                 'class_id': cls_id,
-                'class_name': self.DETECTION_CLASSES[cls_id],
+                'class_name': class_name,
                 'confidence': conf,
-                'center': (cx, cy)
+                'center': (cx, cy),
+                'distance': distance
             }
             
             detections.append(detection)
-            self.detection_stats[self.DETECTION_CLASSES[cls_id]] += 1
+            self.detection_stats[class_name] += 1
         
         return detections
     
@@ -278,7 +324,7 @@ class DrivingAssistant:
         
         Args:
             frame: Original frame
-            detections: Detected objects with tracking and lane info
+            detections: Detected objects with tracking, lane info, and distance
             lane_overlay: Lane detection overlay
             
         Returns:
@@ -297,31 +343,49 @@ class DrivingAssistant:
             confidence = det['confidence']
             track_id = det.get('track_id', -1)
             lane = det.get('lane', None)
+            distance = det.get('distance', 0)
             cx, cy = det['center']
             
             # Get color for class
             color = self.CLASS_COLORS.get(class_name, (255, 255, 255))
             
+            # Distance-based warning color
+            if distance > 0:
+                if distance < 10:  # Close distance - red warning
+                    box_color = (0, 0, 255)
+                    thickness = 3
+                elif distance < 20:  # Medium distance - orange warning
+                    box_color = (0, 165, 255)
+                    thickness = 2
+                else:  # Safe distance - green
+                    box_color = (0, 255, 0)
+                    thickness = 2
+            else:
+                box_color = color
+                thickness = 2
+            
             # Draw bounding box
-            cv2.rectangle(output, (x1, y1), (x2, y2), color, 2)
+            cv2.rectangle(output, (x1, y1), (x2, y2), box_color, thickness)
             
             # Draw center point
             cv2.circle(output, (cx, cy), 5, color, -1)
             
-            # Prepare label
+            # Prepare label with distance included (no pipe separators)
             label = f"{class_name} {confidence:.2f}"
             if track_id != -1:
                 label += f" ID:{track_id}"
             if lane is not None:
                 label += f" L{lane}"
+            if distance > 0:
+                label += f" {distance:.1f}m"
             
-            # Draw label background
-            (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-            cv2.rectangle(output, (x1, y1 - label_h - 10), (x1 + label_w, y1), color, -1)
+            # Draw label background box
+            (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 2)
+            cv2.rectangle(output, (x1, y1 - label_h - 8), (x1 + label_w + 6, y1), box_color, -1)
             
             # Draw label text
-            cv2.putText(output, label, (x1, y1 - 5), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(output, label, (x1 + 3, y1 - 4), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 2)
         
         return output
     
@@ -467,13 +531,21 @@ class DrivingAssistant:
             
             # Final statistics
             total_time = time.time() - start_time
+            
+            # Get lane detection accuracy
+            lane_accuracy = 0.0
+            if self.lane_detector is not None:
+                lane_accuracy = self.lane_detector.get_accuracy()
+            
             print(f"\n✅ Processing complete!")
             print(f"   Total frames: {self.frame_count}")
             print(f"   Total time: {total_time:.1f}s")
             print(f"   Average FPS: {self.frame_count/total_time:.1f}")
             print(f"   Output saved: {output_path}")
             
-            print(f"\n📊 Detection Statistics:")
+            print(f"\n🎯 Lane Detection Accuracy: {lane_accuracy:.2f}%")
+            
+            print(f"\n📊 Object Detection Statistics:")
             for class_name, count in self.detection_stats.items():
                 print(f"   {class_name}: {count}")
 
